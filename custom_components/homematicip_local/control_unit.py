@@ -1410,6 +1410,7 @@ class ControlConfig:
             timeout_config=TimeoutConfig(
                 command_retry_max_attempts=self._command_retry_max_attempts,
                 command_throttle_interval=self._command_throttle_interval,
+                rpc_timeout=120,
             ),
             start_direct=self._start_direct,
             storage_directory=get_storage_directory(hass=self.hass),

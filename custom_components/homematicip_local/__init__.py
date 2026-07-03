@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 import contextlib
 from dataclasses import dataclass
@@ -25,7 +26,6 @@ from aiohomematic.support import find_free_port
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PORT, EVENT_HOMEASSISTANT_STOP, __version__ as HA_VERSION_STR
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import device_registry as dr, entity_registry as er, issue_registry as ir
 from homeassistant.helpers.entity_registry import async_migrate_entries
 from homeassistant.helpers.issue_registry import async_delete_issue
@@ -78,6 +78,13 @@ class HomematicData:
 
 HM_KEY: HassKey[HomematicData] = HassKey(DOMAIN)
 _LOGGER = logging.getLogger(__name__)
+
+# Tracks the in-flight background "start_central" task per config entry, so
+# async_unload_entry can cancel and await it before calling stop_central().
+# Without this, a reload while the background start is still running (e.g.
+# stuck in a slow CCU RPC call) races start() and stop() on the same central
+# instance, which can hang the reload indefinitely.
+_START_CENTRAL_TASKS: dict[str, asyncio.Task[None]] = {}
 
 # Issue types that should be cleared on startup as they are transient
 # and not relevant after a restart
@@ -192,16 +199,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: HomematicConfigEntry) ->
     ).create_control_unit()
     entry.runtime_data = control
     await hass.config_entries.async_forward_entry_setups(entry, HMIP_LOCAL_PLATFORMS)
-    try:
-        await control.start_central()
-    except AuthFailure as err:
-        _LOGGER.warning(
-            "Authentication failed for %s. Triggering reauthentication flow",
-            entry.data.get(CONF_INSTANCE_NAME),
-        )
-        raise ConfigEntryAuthFailed("Authentication failed") from err
-    if not is_loom_backend:
-        await _async_reanchor_hub_unique_ids_on_serial_change(hass, entry, control)
+
+    async def _start_central_in_background() -> None:
+        """Start the central without blocking config entry setup."""
+        try:
+            await control.start_central()
+        except AuthFailure:
+            _LOGGER.warning(
+                "Authentication failed for %s. Triggering reauthentication flow",
+                entry.data.get(CONF_INSTANCE_NAME),
+            )
+            entry.async_start_reauth(hass)
+            return
+        except Exception:
+            _LOGGER.exception(
+                "Unexpected error starting central unit for %s in background",
+                entry.data.get(CONF_INSTANCE_NAME),
+            )
+            return
+        if not is_loom_backend:
+            await _async_reanchor_hub_unique_ids_on_serial_change(hass, entry, control)
+
+    _START_CENTRAL_TASKS[entry.entry_id] = entry.async_create_background_task(
+        hass, _start_central_in_background(), f"homematicip_local_start_central_{entry.entry_id}"
+    )
     await async_setup_services(hass)
 
     # Register WebSocket commands once (HA raises on duplicate registration)
@@ -237,6 +258,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: HomematicConfigEntry) -
     # First unload platforms so entities can unsubscribe from events
     # (async_will_remove_from_hass is called for each entity)
     unload_ok = await hass.config_entries.async_unload_platforms(entry, HMIP_LOCAL_PLATFORMS)
+    # Cancel the still-running background start (if any) before stopping the
+    # central, to avoid start() and stop() racing on the same central instance.
+    if start_task := _START_CENTRAL_TASKS.pop(entry.entry_id, None):
+        start_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await start_task
     # Then stop the central unit
     if hasattr(entry, "runtime_data") and (control := entry.runtime_data):
         await control.stop_central()
