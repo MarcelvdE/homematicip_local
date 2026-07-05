@@ -131,7 +131,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: HomematicConfigEntry) ->
     # aiohomematic version gate for it.
     is_loom_backend = entry.data.get(CONF_BACKEND) == BACKEND_LOOM
     expected_version = await get_aiohomematic_version(hass=hass, domain=entry.domain, package_name="aiohomematic")
-    if not is_loom_backend and AwesomeVersion(expected_version) != AwesomeVersion(HAHM_VERSION):
+    if (
+        not is_loom_backend
+        and expected_version is not None
+        and AwesomeVersion(expected_version) != AwesomeVersion(HAHM_VERSION)
+    ):
         _LOGGER.error(
             "This release of Homematic(IP) Local for OpenCCU requires aiohomematic version %s, but found version %s. "
             "Looks like HA has a problem with dependency management. "
