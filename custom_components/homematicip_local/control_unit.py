@@ -1490,7 +1490,16 @@ async def validate_config_and_get_system_information(
 ) -> SystemInformation | None:
     """Validate the control configuration."""
     if control_unit := await control_config.create_control_unit_temp():
-        return await control_unit.central.validate_config_and_get_system_information()
+        try:
+            return await control_unit.central.validate_config_and_get_system_information()
+        finally:
+            # Without this, every config-flow validation (initial setup, reconfigure,
+            # interface step, ...) leaks the temporary central's XML-RPC proxies and
+            # CommandThrottle worker tasks - they are only torn down (noisily, via
+            # "Task was destroyed but it is pending!") whenever the leaked object
+            # happens to be garbage-collected, and in the meantime keep holding
+            # connections/sessions open against the CCU.
+            await control_unit.stop_central()
     return None
 
 
