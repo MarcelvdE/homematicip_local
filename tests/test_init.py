@@ -29,6 +29,7 @@ from custom_components.homematicip_local.const import (
 from custom_components.homematicip_local.control_unit import ControlUnit
 from custom_components.homematicip_local.support import realign_hub_unique_id
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 
@@ -241,6 +242,32 @@ class TestUnloadEntry:
     # assert HMIP_DOMAIN not in hass.data
     # retry possible?
     # assert await hass.config_entries.async_unload(mock_loaded_config_entry.entry_id) is False
+
+    async def test_stop_event_listener_removed_on_unload(
+        self,
+        hass: HomeAssistant,
+        mock_loaded_config_entry: MockConfigEntry,
+        mock_control_unit: ControlUnit,
+    ) -> None:
+        """The EVENT_HOMEASSISTANT_STOP listener must not fire stop_central() again after unload.
+
+        Regression test: the listener registered in async_setup_entry was not
+        wrapped in entry.async_on_unload, so it stayed registered on the event bus
+        after the entry was unloaded. A subsequently fired EVENT_HOMEASSISTANT_STOP
+        (as happens during a real HA shutdown) would then invoke stop_central() a
+        second time for an already-unloaded entry, racing the central's stop() call
+        and crashing with an InvalidStateTransitionError.
+        """
+        assert await hass.config_entries.async_unload(mock_loaded_config_entry.entry_id) is True
+        await hass.async_block_till_done()
+        assert mock_control_unit.stop_central.call_count == 1
+
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+        await hass.async_block_till_done()
+
+        # The listener was unsubscribed on unload, so the STOP event must not
+        # trigger a second stop_central() call.
+        assert mock_control_unit.stop_central.call_count == 1
 
 
 async def test_remove_entry(hass: HomeAssistant, mock_loaded_config_entry: MockConfigEntry) -> None:

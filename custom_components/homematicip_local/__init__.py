@@ -249,8 +249,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: HomematicConfigEntry) ->
     # Register Lovelace cards (always, independent of panel setting)
     await async_register_cards(hass)
 
-    # Register on HA stop event to gracefully shutdown Homematic(IP) Local connection
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, control.stop_central)
+    # Register on HA stop event to gracefully shutdown Homematic(IP) Local connection.
+    # Wrapped in async_on_unload so the listener is removed the moment this entry is
+    # unloaded; otherwise EVENT_HOMEASSISTANT_STOP could still fire stop_central() a
+    # second time for an already-unloaded entry during a real HA shutdown.
+    entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, control.stop_central))
     entry.async_on_unload(entry.add_update_listener(update_listener))
     async_notify_backup_listeners(hass)
     return True
