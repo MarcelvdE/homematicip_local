@@ -53,7 +53,6 @@ from aiohomematic.const import (
     TimeoutConfig,
     get_interface_default_port,
 )
-from aiohomematic.exceptions import AuthFailure, BaseHomematicException
 from aiohomematic.model.data_point import CallbackDataPoint
 from aiohomematic.support.address import get_device_address
 from homeassistant.const import CONF_HOST, CONF_PATH, CONF_PORT
@@ -250,24 +249,18 @@ class BaseControlUnit:
         return self._entry_id
 
     async def start_central(self) -> None:
-        """Start the central unit."""
+        """Start the central unit.
+
+        Raises ``AuthFailure`` and ``BaseHomematicException`` to the caller
+        instead of swallowing them, so the background start task in
+        ``__init__.py`` can trigger reauth resp. retry with backoff.
+        """
         _LOGGER.debug(
             "Starting central unit %s",
             self._instance_name,
         )
-        try:
-            await self._central.start()
-            _LOGGER.info("Started central unit for %s (%s)", self._instance_name, AIOHM_VERSION)
-        except AuthFailure:
-            # Don't catch - let it propagate to trigger reauth
-            raise
-        except BaseHomematicException as ex:
-            _LOGGER.warning(
-                "START_CENTRAL: Failed to start central unit for %s: %s",
-                self._instance_name,
-                ex,
-                exc_info=True,
-            )
+        await self._central.start()
+        _LOGGER.info("Started central unit for %s (%s)", self._instance_name, AIOHM_VERSION)
 
     async def stop_central(self, *args: Any) -> None:
         """Stop the control unit."""
@@ -1354,7 +1347,7 @@ class ControlConfig:
         for entry in self.hass.config_entries.async_entries(domain=DOMAIN):
             if entry.entry_id == self.entry_id or len(entry.data) == 0:
                 continue
-            if hasattr(entry.data, CONF_INSTANCE_NAME) and entry.data[CONF_INSTANCE_NAME] == self.instance_name:
+            if CONF_INSTANCE_NAME in entry.data and entry.data[CONF_INSTANCE_NAME] == self.instance_name:
                 return False
         return True
 

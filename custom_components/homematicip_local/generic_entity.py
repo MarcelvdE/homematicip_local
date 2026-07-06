@@ -9,6 +9,7 @@ from typing import Any, Final, Generic, override
 from aiohomematic import ccu_translations
 from aiohomematic.central.events import DataPointStateChangedEvent, DeviceRemovedEvent, SubscriptionGroup
 from aiohomematic.const import CallSource, DataPointCategory, DataPointUsage
+from aiohomematic.exceptions import BaseHomematicException
 from aiohomematic.interfaces import (
     CalculatedDataPointProtocol,
     CallbackDataPointProtocol,
@@ -341,7 +342,17 @@ class AioHomematicGenericEntity(Entity, Generic[HmGenericDataPointProtocol]):
             | CustomDataPointProtocol
             | GenericDataPointProtocol,
         ):
-            await self._data_point.load_data_point_value(call_source=CallSource.HA_INIT)
+            try:
+                await self._data_point.load_data_point_value(call_source=CallSource.HA_INIT)
+            except BaseHomematicException as ex:
+                # A CCU communication error during the initial load is expected
+                # (e.g. a transient timeout); the value arrives later via push,
+                # so the entity is still added rather than failing setup.
+                _LOGGER.warning(
+                    "Initial value load failed for %s: %s. Values will arrive via push",
+                    self._data_point.full_name,
+                    ex,
+                )
         if (
             isinstance(self._data_point, CalculatedDataPointProtocol | GenericDataPointProtocol)
             and not self._data_point.is_valid

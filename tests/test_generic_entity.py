@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from aiohomematic.const import DataPointCategory
+from aiohomematic.exceptions import NoConnectionException
+from aiohomematic.interfaces import GenericDataPointProtocol
 from custom_components.homematicip_local.const import DOMAIN
 from custom_components.homematicip_local.control_unit import ControlUnit
 from custom_components.homematicip_local.generic_entity import AioHomematicGenericEntity
@@ -224,3 +226,52 @@ class TestScheduleSubdevice:
         # Entity stays on main device, not a separate schedule sub-device
         assert device_info["identifiers"] == {(DOMAIN, _DEVICE_IDENTIFIER)}
         assert device_info["via_device"] == (DOMAIN, _CENTRAL_NAME)
+
+
+def _build_bare_entity(*, mock_dp: MagicMock) -> AioHomematicGenericEntity:
+    """Build an entity without running __init__, to unit-test async_added_to_hass in isolation."""
+    entity = AioHomematicGenericEntity.__new__(AioHomematicGenericEntity)
+    entity._data_point = mock_dp
+    entity._subscription_group = MagicMock()
+    return entity
+
+
+class TestAsyncAddedToHass:
+    """Cover async_added_to_hass()'s handling of the initial (HA_INIT) value load."""
+
+    async def test_initial_value_load_failure_is_caught_and_entity_still_added(self) -> None:
+        """A BaseHomematicException during the initial load must not prevent the entity from being added.
+
+        Regression test: a CCU communication error during the initial HA_INIT value load
+        (e.g. a timeout while the CCU was still starting up) propagated out of
+        async_added_to_hass with a full traceback, so HA dropped the entity entirely
+        instead of adding it with a value that arrives later via push.
+        """
+        mock_dp = MagicMock(spec=GenericDataPointProtocol)
+        mock_dp.unique_id = "test_unique_id"
+        mock_dp.full_name = "Test Entity"
+        mock_dp.is_valid = True
+        mock_dp.load_data_point_value = AsyncMock(side_effect=NoConnectionException("CCU unreachable"))
+        entity = _build_bare_entity(mock_dp=mock_dp)
+
+        # Must not raise.
+        await AioHomematicGenericEntity.async_added_to_hass(entity)
+
+        mock_dp.load_data_point_value.assert_awaited_once()
+
+    async def test_initial_value_load_unexpected_error_still_propagates(self) -> None:
+        """A non-CCU error during the initial load must still propagate (fail fast).
+
+        Only aiohomematic's own BaseHomematicException is treated as an expected, transient
+        CCU-communication failure; any other exception (e.g. a genuine bug) must still
+        surface loudly instead of being silently swallowed.
+        """
+        mock_dp = MagicMock(spec=GenericDataPointProtocol)
+        mock_dp.unique_id = "test_unique_id"
+        mock_dp.full_name = "Test Entity"
+        mock_dp.is_valid = True
+        mock_dp.load_data_point_value = AsyncMock(side_effect=TypeError("boom"))
+        entity = _build_bare_entity(mock_dp=mock_dp)
+
+        with pytest.raises(TypeError, match="boom"):
+            await AioHomematicGenericEntity.async_added_to_hass(entity)

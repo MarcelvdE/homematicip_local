@@ -8,7 +8,7 @@ import contextlib
 from dataclasses import dataclass
 import logging
 import time
-from typing import Any, TypeAlias
+from typing import Any, Final, TypeAlias
 
 from awesomeversion import AwesomeVersion
 
@@ -20,12 +20,12 @@ from aiohomematic.const import (
     OptionalSettings,
     is_interface_default_port,
 )
-from aiohomematic.exceptions import AuthFailure
+from aiohomematic.exceptions import AuthFailure, BaseHomematicException
 from aiohomematic.store.persistent import cleanup_files
 from aiohomematic.support import find_free_port
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PORT, EVENT_HOMEASSISTANT_STOP, __version__ as HA_VERSION_STR
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr, entity_registry as er, issue_registry as ir
 from homeassistant.helpers.entity_registry import async_migrate_entries
 from homeassistant.helpers.issue_registry import async_delete_issue
@@ -80,11 +80,18 @@ HM_KEY: HassKey[HomematicData] = HassKey(DOMAIN)
 _LOGGER = logging.getLogger(__name__)
 
 # Tracks the in-flight background "start_central" task per config entry, so
-# async_unload_entry can cancel and await it before calling stop_central().
-# Without this, a reload while the background start is still running (e.g.
-# stuck in a slow CCU RPC call) races start() and stop() on the same central
-# instance, which can hang the reload indefinitely.
+# async_unload_entry (and the HA-stop listener) can cancel and await it before
+# calling stop_central(). Without this, a reload or HA shutdown while the
+# background start is still running (e.g. stuck in a slow CCU RPC call, or
+# retrying after a transient failure) races start() and stop() on the same
+# central instance, which can hang indefinitely.
 _START_CENTRAL_TASKS: dict[str, asyncio.Task[None]] = {}
+
+# Backoff for retrying a failed start_central() in the background: doubles
+# after each transient (BaseHomematicException) failure, capped so a CCU that
+# stays unreachable for a long time is retried at a sane, bounded interval.
+_START_CENTRAL_RETRY_INITIAL_DELAY: Final = 30.0
+_START_CENTRAL_RETRY_MAX_DELAY: Final = 300.0
 
 # Issue types that should be cleared on startup as they are transient
 # and not relevant after a restart
@@ -98,6 +105,55 @@ _STALE_ISSUE_TYPES: tuple[str, ...] = (
     "interface_not_reachable",
     "xmlrpc_server_receives_no_events",
 )
+
+
+async def _async_cancel_background_start(*, entry_id: str) -> None:
+    """Cancel and await the in-flight background start task for an entry, if any."""
+    if start_task := _START_CENTRAL_TASKS.pop(entry_id, None):
+        start_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await start_task
+
+
+async def _async_start_central_in_background(
+    *, hass: HomeAssistant, entry: HomematicConfigEntry, control: ControlUnit, is_loom_backend: bool
+) -> None:
+    """Start the central without blocking config entry setup; retry transient failures with backoff."""
+    retry_delay = _START_CENTRAL_RETRY_INITIAL_DELAY
+    while True:
+        try:
+            await control.start_central()
+        except AuthFailure:
+            _LOGGER.warning(
+                "Authentication failed for %s. Triggering reauthentication flow",
+                entry.data.get(CONF_INSTANCE_NAME),
+            )
+            entry.async_start_reauth(hass)
+            return
+        except asyncio.CancelledError:
+            # Propagate so the cancelling task (unload / HA stop) observes
+            # a clean cancellation instead of an endless retry loop.
+            raise
+        except BaseHomematicException as ex:
+            _LOGGER.warning(
+                "Starting central unit for %s failed (%s); retrying in %.0f s",
+                entry.data.get(CONF_INSTANCE_NAME),
+                ex,
+                retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, _START_CENTRAL_RETRY_MAX_DELAY)
+            continue
+        except Exception:
+            _LOGGER.exception(
+                "Unexpected error starting central unit for %s in background",
+                entry.data.get(CONF_INSTANCE_NAME),
+            )
+            return
+        else:
+            break
+    if not is_loom_backend:
+        await _async_reanchor_hub_unique_ids_on_serial_change(hass, entry, control)
 
 
 def _cleanup_stale_issues(*, hass: HomeAssistant, entry_id: str) -> None:
@@ -204,28 +260,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: HomematicConfigEntry) ->
     entry.runtime_data = control
     await hass.config_entries.async_forward_entry_setups(entry, HMIP_LOCAL_PLATFORMS)
 
-    async def _start_central_in_background() -> None:
-        """Start the central without blocking config entry setup."""
-        try:
-            await control.start_central()
-        except AuthFailure:
-            _LOGGER.warning(
-                "Authentication failed for %s. Triggering reauthentication flow",
-                entry.data.get(CONF_INSTANCE_NAME),
-            )
-            entry.async_start_reauth(hass)
-            return
-        except Exception:
-            _LOGGER.exception(
-                "Unexpected error starting central unit for %s in background",
-                entry.data.get(CONF_INSTANCE_NAME),
-            )
-            return
-        if not is_loom_backend:
-            await _async_reanchor_hub_unique_ids_on_serial_change(hass, entry, control)
-
     _START_CENTRAL_TASKS[entry.entry_id] = entry.async_create_background_task(
-        hass, _start_central_in_background(), f"homematicip_local_start_central_{entry.entry_id}"
+        hass,
+        _async_start_central_in_background(hass=hass, entry=entry, control=control, is_loom_backend=is_loom_backend),
+        f"homematicip_local_start_central_{entry.entry_id}",
     )
     await async_setup_services(hass)
 
@@ -249,11 +287,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: HomematicConfigEntry) ->
     # Register Lovelace cards (always, independent of panel setting)
     await async_register_cards(hass)
 
+    async def _async_stop_central_on_ha_stop(_event: Event) -> None:
+        """Cancel an in-flight background start, then stop the central, on HA shutdown.
+
+        Mirrors async_unload_entry's cancel-before-stop: without cancelling first, a
+        background start still retrying (e.g. a CCU that is slow or unreachable) would
+        race start() and stop() on the same central instance during HA shutdown.
+        """
+        await _async_cancel_background_start(entry_id=entry.entry_id)
+        await control.stop_central()
+
     # Register on HA stop event to gracefully shutdown Homematic(IP) Local connection.
     # Wrapped in async_on_unload so the listener is removed the moment this entry is
     # unloaded; otherwise EVENT_HOMEASSISTANT_STOP could still fire stop_central() a
     # second time for an already-unloaded entry during a real HA shutdown.
-    entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, control.stop_central))
+    entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stop_central_on_ha_stop))
     entry.async_on_unload(entry.add_update_listener(update_listener))
     async_notify_backup_listeners(hass)
     return True
@@ -267,10 +315,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: HomematicConfigEntry) -
     unload_ok = await hass.config_entries.async_unload_platforms(entry, HMIP_LOCAL_PLATFORMS)
     # Cancel the still-running background start (if any) before stopping the
     # central, to avoid start() and stop() racing on the same central instance.
-    if start_task := _START_CENTRAL_TASKS.pop(entry.entry_id, None):
-        start_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await start_task
+    await _async_cancel_background_start(entry_id=entry.entry_id)
     # Then stop the central unit
     if hasattr(entry, "runtime_data") and (control := entry.runtime_data):
         await control.stop_central()

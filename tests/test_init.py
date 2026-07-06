@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,7 +10,7 @@ import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from aiohomematic.const import CentralState, DeviceTriggerEventType
-from aiohomematic.exceptions import AuthFailure
+from aiohomematic.exceptions import AuthFailure, NoConnectionException
 import custom_components.homematicip_local
 from custom_components.homematicip_local import (
     _aiohomematic_restored_unique_id,
@@ -268,6 +269,123 @@ class TestUnloadEntry:
         # The listener was unsubscribed on unload, so the STOP event must not
         # trigger a second stop_central() call.
         assert mock_control_unit.stop_central.call_count == 1
+
+
+class TestStartCentralBackground:
+    """Cover the background start_central task's interaction with unload and HA shutdown."""
+
+    async def test_ha_stop_cancels_in_flight_background_start_before_stopping_central(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry_v2: MockConfigEntry,
+        mock_control_unit: ControlUnit,
+    ) -> None:
+        """EVENT_HOMEASSISTANT_STOP must cancel a still-running background start before stop_central().
+
+        Regression test: the HA-stop listener called stop_central() directly, without first
+        cancelling a background start_central() that might still be running (e.g. retrying
+        against a slow/unreachable CCU) - racing start() and stop() on the same central
+        instance during a real HA shutdown.
+        """
+        start_can_finish = asyncio.Event()
+        start_call_count = 0
+
+        async def _blocking_start_central() -> None:
+            nonlocal start_call_count
+            start_call_count += 1
+            await start_can_finish.wait()
+
+        mock_control_unit.start_central = AsyncMock(side_effect=_blocking_start_central)
+        mock_control_unit.stop_central = AsyncMock()
+
+        with (
+            patch("custom_components.homematicip_local.find_free_port", return_value=8765),
+            patch(
+                "custom_components.homematicip_local.control_unit.ControlConfig.create_control_unit",
+                return_value=mock_control_unit,
+            ),
+        ):
+            mock_config_entry_v2.add_to_hass(hass)
+            await hass.config_entries.async_setup(mock_config_entry_v2.entry_id)
+            await hass.async_block_till_done()
+
+        start_task = custom_components.homematicip_local._START_CENTRAL_TASKS[mock_config_entry_v2.entry_id]
+        assert not start_task.done()
+        assert start_call_count == 1
+        assert mock_control_unit.stop_central.call_count == 0
+
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+        await hass.async_block_till_done()
+
+        assert start_task.cancelled()
+        mock_control_unit.stop_central.assert_called_once()
+
+    async def test_background_start_retries_after_transient_failure(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry_v2: MockConfigEntry,
+        mock_control_unit: ControlUnit,
+    ) -> None:
+        """A transient BaseHomematicException from start_central() must be retried, not swallowed.
+
+        Regression test: start_central() used to catch BaseHomematicException itself and only
+        log a warning, so the background task considered a failed start "done" - the entry
+        stayed loaded without devices and without ever retrying until a manual reload.
+        """
+        mock_control_unit.start_central = AsyncMock(side_effect=[NoConnectionException("CCU unreachable"), None])
+
+        with (
+            patch("custom_components.homematicip_local.find_free_port", return_value=8765),
+            patch(
+                "custom_components.homematicip_local.control_unit.ControlConfig.create_control_unit",
+                return_value=mock_control_unit,
+            ),
+            patch("custom_components.homematicip_local._START_CENTRAL_RETRY_INITIAL_DELAY", 0.0),
+        ):
+            mock_config_entry_v2.add_to_hass(hass)
+            await hass.config_entries.async_setup(mock_config_entry_v2.entry_id)
+            start_task = custom_components.homematicip_local._START_CENTRAL_TASKS[mock_config_entry_v2.entry_id]
+            await asyncio.wait_for(start_task, timeout=5)
+
+        assert mock_control_unit.start_central.call_count == 2
+
+    async def test_unload_cancels_background_start_during_retry_backoff(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry_v2: MockConfigEntry,
+        mock_control_unit: ControlUnit,
+    ) -> None:
+        """Unloading the entry while the background start is sleeping between retries must not hang or leak.
+
+        Regression test: without asyncio.CancelledError propagating cleanly out of the retry
+        loop's ``await asyncio.sleep(retry_delay)``, cancelling the background task during a
+        backoff wait could leave it in an inconsistent state instead of cleanly cancelled,
+        defeating the unload cancel-before-stop guard.
+        """
+        mock_control_unit.start_central = AsyncMock(side_effect=NoConnectionException("CCU unreachable"))
+        mock_control_unit.stop_central = AsyncMock()
+
+        with (
+            patch("custom_components.homematicip_local.find_free_port", return_value=8765),
+            patch(
+                "custom_components.homematicip_local.control_unit.ControlConfig.create_control_unit",
+                return_value=mock_control_unit,
+            ),
+            patch("custom_components.homematicip_local._START_CENTRAL_RETRY_INITIAL_DELAY", 60.0),
+        ):
+            mock_config_entry_v2.add_to_hass(hass)
+            await hass.config_entries.async_setup(mock_config_entry_v2.entry_id)
+            await hass.async_block_till_done()
+
+            start_task = custom_components.homematicip_local._START_CENTRAL_TASKS[mock_config_entry_v2.entry_id]
+            assert not start_task.done()
+            assert mock_control_unit.start_central.call_count == 1
+
+            assert await hass.config_entries.async_unload(mock_config_entry_v2.entry_id) is True
+            await hass.async_block_till_done()
+
+        assert start_task.cancelled()
+        mock_control_unit.stop_central.assert_called_once()
 
 
 async def test_remove_entry(hass: HomeAssistant, mock_loaded_config_entry: MockConfigEntry) -> None:
